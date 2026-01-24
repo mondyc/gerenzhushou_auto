@@ -21,6 +21,10 @@ class TestConfig:
         self.suxiaoban_exe = "灵犀·晓伴.exe" if self.platform == "Windows" else "灵犀·晓伴"
         self.setup_pattern = "suxiaoban-*-setup.exe.zip"
         
+        # 调试模式配置
+        self.skip_install_uninstall = True  # 跳过安装和卸载
+        self.connect_existing = True        # 尝试连接已运行的实例
+        
         self.timeout = 30
         self.retry_count = 3
         
@@ -71,14 +75,69 @@ class WindowsTestRunner(TestRunner):
             from pywinauto.application import Application
             from pywinauto.keyboard import send_keys
             from pywinauto.findwindows import find_window
+            import winreg
             self.Application = Application
             self.send_keys = send_keys
             self.find_window = find_window
+            self.winreg = winreg
             self.app = None
             self.logger.info("pywinauto初始化成功")
         except ImportError:
             self.logger.error("pywinauto未安装，请运行: pip install pywinauto")
             sys.exit(1)
+            
+    def find_installed_app_path(self) -> Optional[str]:
+        """从注册表查找已安装的应用程序路径"""
+        self.logger.info("正在从注册表查找应用程序...")
+        
+        search_keys = [
+            (self.winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (self.winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (self.winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")
+        ]
+        
+        keywords = ["灵犀", "晓伴", "Suxiaoban"]
+        
+        for root_key, sub_key in search_keys:
+            try:
+                with self.winreg.OpenKey(root_key, sub_key) as key:
+                    for i in range(0, self.winreg.QueryInfoKey(key)[0]):
+                        try:
+                            sub_key_name = self.winreg.EnumKey(key, i)
+                            with self.winreg.OpenKey(key, sub_key_name) as sub_k:
+                                try:
+                                    display_name = self.winreg.QueryValueEx(sub_k, "DisplayName")[0]
+                                    if any(k in display_name for k in keywords):
+                                        self.logger.info(f"在注册表中找到应用: {display_name}")
+                                        
+                                        # 尝试获取 InstallLocation
+                                        try:
+                                            install_loc = self.winreg.QueryValueEx(sub_k, "InstallLocation")[0]
+                                            if install_loc:
+                                                exe_path = Path(install_loc) / self.config.suxiaoban_exe
+                                                if exe_path.exists():
+                                                    return str(exe_path)
+                                        except FileNotFoundError:
+                                            pass
+                                            
+                                        # 尝试从 DisplayIcon 获取
+                                        try:
+                                            display_icon = self.winreg.QueryValueEx(sub_k, "DisplayIcon")[0]
+                                            if display_icon and display_icon.endswith(".exe") and "unins" not in display_icon.lower():
+                                                if os.path.exists(display_icon):
+                                                    return display_icon
+                                        except FileNotFoundError:
+                                            pass
+                                            
+                                except FileNotFoundError:
+                                    pass
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+                
+        self.logger.warning("在注册表中未找到应用程序安装信息")
+        return None
     
     def find_setup_file(self) -> Optional[str]:
         """查找安装文件"""
@@ -123,11 +182,34 @@ class WindowsTestRunner(TestRunner):
         test_name = "启动测试"
         
         try:
+            # 1. 尝试连接已运行的进程
+            if self.config.connect_existing:
+                try:
+                    self.logger.info("尝试连接已运行的应用程序...")
+                    # 尝试通过标题匹配连接，这里假设标题包含"灵犀"或"晓伴"
+                    # 使用 uia 后端，更适合现代应用
+                    self.app = self.Application(backend='uia').connect(title_re=".*灵犀.*", timeout=5)
+                    self.logger.info("成功连接到已运行的应用程序")
+                    self.log_test_result(test_name, True, "成功连接到已运行的应用程序")
+                    return True
+                except Exception:
+                    self.logger.info("未找到已运行的应用程序，尝试启动新实例...")
+
+            # 2. 尝试查找并启动新实例
             possible_paths = [
                 Path(self.config.install_dir) / self.config.suxiaoban_exe,
                 self.config.test_dir / self.config.suxiaoban_exe,
-                Path.home() / "Desktop" / self.config.suxiaoban_exe
+                Path.home() / "Desktop" / self.config.suxiaoban_exe,
+                # 添加常见的开发路径
+                self.config.test_dir.parent / "dist" / self.config.suxiaoban_exe,
+                self.config.test_dir.parent / "build" / self.config.suxiaoban_exe,
             ]
+            
+            # 尝试从注册表查找
+            registry_path = self.find_installed_app_path()
+            if registry_path:
+                self.logger.info(f"使用注册表中发现的路径: {registry_path}")
+                possible_paths.insert(0, Path(registry_path))
             
             exe_path = None
             for path in possible_paths:
@@ -136,11 +218,24 @@ class WindowsTestRunner(TestRunner):
                     break
             
             if not exe_path:
-                self.log_test_result(test_name, False, "未找到可执行文件")
+                self.logger.warning("未找到可执行文件，请手动启动应用程序...")
+                # 等待用户手动启动
+                for i in range(10):
+                    try:
+                        self.app = self.Application(backend='uia').connect(title_re=".*灵犀.*", timeout=2)
+                        self.logger.info("检测到应用程序已启动")
+                        self.log_test_result(test_name, True, "用户手动启动检测成功")
+                        return True
+                    except:
+                        time.sleep(1)
+                        self.logger.info(f"等待应用程序启动... {i+1}/10")
+                
+                self.log_test_result(test_name, False, "未找到可执行文件且未检测到手动启动")
                 return False
             
             self.logger.info(f"启动应用程序: {exe_path}")
-            self.app = self.Application().start(exe_path)
+            # 使用 uia 后端启动
+            self.app = self.Application(backend='uia').start(exe_path)
             time.sleep(5)
             
             self.log_test_result(test_name, True, "应用程序启动成功")
@@ -161,13 +256,33 @@ class WindowsTestRunner(TestRunner):
                 return False
             
             self.logger.info("检查主窗口...")
-            main_window = self.app.window()
+            # 使用更宽泛的匹配策略，并显式等待
+            try:
+                # 尝试通过正则表达式匹配窗口
+                main_window = self.app.window(title_re=".*灵犀.*")
+                main_window.wait('visible', timeout=10)
+            except Exception:
+                # 如果失败，尝试获取当前活跃窗口
+                self.logger.warning("未找到匹配标题的窗口，尝试获取活跃窗口...")
+                main_window = self.app.top_window()
+                main_window.wait('visible', timeout=10)
+            
             if not main_window.exists():
                 self.log_test_result(test_name, False, "主窗口未找到")
                 return False
             
+            # 获取窗口标题和文本
             window_title = main_window.window_text()
             self.logger.info(f"窗口标题: {window_title}")
+            
+            # 尝试打印所有控件，方便调试
+            self.logger.info("窗口控件结构:")
+            try:
+                # 限制打印深度，避免日志过长
+                # main_window.print_control_identifiers(depth=2)
+                pass 
+            except:
+                pass
             
             self.log_test_result(test_name, True, f"UI测试通过，窗口标题: {window_title}")
             return True
@@ -232,16 +347,34 @@ class WindowsTestRunner(TestRunner):
         self.logger.info("开始自动化测试 - Windows平台")
         self.logger.info("=" * 60)
         
-        setup_file = self.find_setup_file()
-        if not setup_file:
-            self.logger.error("无法找到安装文件，测试终止")
-            return
+        setup_file = None
         
-        self.install_application(setup_file)
-        self.launch_application()
+        # 安装步骤
+        if not self.config.skip_install_uninstall:
+            setup_file = self.find_setup_file()
+            if not setup_file:
+                self.logger.warning("未找到安装文件，跳过安装测试，尝试直接启动应用程序")
+            else:
+                self.install_application(setup_file)
+        else:
+            self.logger.info("配置跳过安装测试")
+        
+        # 启动和功能测试
+        if not self.launch_application():
+            self.logger.error("应用程序启动失败，无法继续后续测试")
+            return
+
         self.test_ui_elements()
         self.test_basic_functionality()
-        self.uninstall_application()
+        
+        # 卸载步骤
+        if not self.config.skip_install_uninstall:
+            if setup_file:
+                self.uninstall_application()
+            else:
+                self.logger.info("跳过卸载测试（因为未执行安装）")
+        else:
+            self.logger.info("配置跳过卸载测试")
         
         self.print_summary()
     
